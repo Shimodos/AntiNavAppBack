@@ -1,0 +1,76 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: wanderer-postgres
+    environment:
+      POSTGRES_USER: wanderer
+      POSTGRES_PASSWORD: wanderer_dev_password
+      POSTGRES_DB: wanderer
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wanderer"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: wanderer-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  valhalla:
+    image: ghcr.io/gis-ops/docker-valhalla/valhalla:latest
+    container_name: wanderer-valhalla
+    ports:
+      - "8002:8002"
+    volumes:
+      - valhalla_data:/custom_files
+      - ./valhalla/valhalla.json:/custom_files/valhalla.json
+    environment:
+      - tile_urls=https://download.geofabrik.de/europe/germany-latest.osm.pbf
+      - use_tiles_ignore_pbf=False
+      - build_elevation=False
+      - build_admins=True
+      - build_time_zones=True
+      - serve_tiles=True
+      - build_tar=False
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Опционально: Adminer для просмотра БД
+  adminer:
+    image: adminer
+    container_name: wanderer-adminer
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+
+volumes:
+  postgres_data:
+  redis_data:
+  valhalla_data:
+
+networks:
+  default:
+    name: wanderer-network

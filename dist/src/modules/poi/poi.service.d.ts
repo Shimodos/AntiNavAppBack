@@ -1,0 +1,33 @@
+import { Repository } from 'typeorm';
+import { ConfigService } from '@nestjs/config';
+import { Coordinates, POI, POICategory, BoundingBox } from '@shared';
+import { OverpassService } from './overpass.service';
+import { POICacheService } from './poi-cache.service';
+import { POIEntity } from './poi.entity';
+export declare class POIService {
+    private readonly poiRepository;
+    private readonly overpassService;
+    private readonly cacheService;
+    private readonly configService;
+    private readonly logger;
+    private readonly maxSearchRadius;
+    private readonly defaultSearchRadius;
+    constructor(poiRepository: Repository<POIEntity>, overpassService: OverpassService, cacheService: POICacheService, configService: ConfigService);
+    searchNearby(center: Coordinates, radius?: number): Promise<POI[]>;
+    getById(id: string): Promise<POI | null>;
+    findInRadius(center: Coordinates, radiusMeters: number, categories: POICategory[], limit?: number): Promise<POI[]>;
+    findInPolygon(polygon: Coordinates[], categories: POICategory[], limit?: number): Promise<POI[]>;
+    findById(id: string): Promise<POI | null>;
+    findBySourceId(source: string, sourceId: string): Promise<POI | null>;
+    search(query: string, center?: Coordinates, radiusMeters?: number, categories?: POICategory[], limit?: number): Promise<POI[]>;
+    private findInRadiusFromDB;
+    private findInBboxFromDB;
+    findInBbox(bbox: BoundingBox, categories: POICategory[], limit?: number): Promise<POI[]>;
+    savePOIs(pois: POI[]): Promise<void>;
+    private mergePOIs;
+    private filterByPolygon;
+    private isPointInPolygon;
+    private buildCacheKey;
+    private entityToPOI;
+    private poiToEntity;
+}
