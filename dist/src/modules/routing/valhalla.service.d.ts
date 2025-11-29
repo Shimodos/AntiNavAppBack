@@ -14,6 +14,7 @@ export interface ValhallaRouteRequest {
         units?: 'kilometers' | 'miles';
         language?: string;
     };
+    alternates?: number;
     id?: string;
 }
 export interface ValhallaRouteResponse {
@@ -75,13 +76,25 @@ export declare class ValhallaService {
     private readonly logger;
     private readonly baseUrl;
     private readonly timeout;
+    private readonly osrmBaseUrl;
+    private valhallaAvailable;
     constructor(httpService: HttpService, configService: ConfigService);
+    private isValhallaAvailable;
     private getCostingProfile;
     private toValhallaLocation;
     route(origin: Coordinates, destination: Coordinates, waypoints?: Coordinates[], mode?: TransportMode, options?: {
         avoidHighways?: boolean;
         avoidTolls?: boolean;
+        alternates?: number;
     }): Promise<ValhallaRouteResponse>;
+    routeWithAlternatives(origin: Coordinates, destination: Coordinates, mode?: TransportMode, numAlternatives?: number, options?: {
+        avoidHighways?: boolean;
+        avoidTolls?: boolean;
+    }): Promise<ValhallaRouteResponse[]>;
+    private routeWithOSRM;
+    private generateScenicRoute;
+    private convertOSRMToValhalla;
+    private mapOSRMManeuverType;
     optimizedRoute(locations: Coordinates[], mode?: TransportMode): Promise<ValhallaRouteResponse>;
     isochrone(location: Coordinates, mode: TransportMode, contours: {
         timeMinutes?: number;

@@ -18,6 +18,7 @@ export interface ValhallaRouteRequest {
     units?: 'kilometers' | 'miles';
     language?: string;
   };
+  alternates?: number;
   id?: string;
 }
 
@@ -81,6 +82,8 @@ export class ValhallaService {
   private readonly logger = new Logger(ValhallaService.name);
   private readonly baseUrl: string;
   private readonly timeout: number;
+  private readonly osrmBaseUrl = 'https://router.project-osrm.org';
+  private valhallaAvailable: boolean | null = null;
 
   constructor(
     private readonly httpService: HttpService,
@@ -88,6 +91,17 @@ export class ValhallaService {
   ) {
     this.baseUrl = this.configService.get<string>('valhalla.url') ?? 'http://localhost:8002';
     this.timeout = this.configService.get<number>('valhalla.timeout') ?? 30000;
+  }
+
+  // Check if Valhalla is available, with caching
+  private async isValhallaAvailable(): Promise<boolean> {
+    if (this.valhallaAvailable !== null) {
+      return this.valhallaAvailable;
+    }
+    this.valhallaAvailable = await this.healthCheck();
+    // Reset cache after 30 seconds
+    setTimeout(() => { this.valhallaAvailable = null; }, 30000);
+    return this.valhallaAvailable;
   }
 
   // Маппинг транспорта на Valhalla costing
@@ -121,8 +135,20 @@ export class ValhallaService {
     options?: {
       avoidHighways?: boolean;
       avoidTolls?: boolean;
+      alternates?: number;
     },
   ): Promise<ValhallaRouteResponse> {
+    // Check if Valhalla is available, fallback to OSRM if not
+    const valhallaReady = await this.isValhallaAvailable();
+    if (!valhallaReady) {
+      this.logger.warn('Valhalla not available, falling back to OSRM for route');
+      const osrmRoutes = await this.routeWithOSRM(origin, destination, mode, 0);
+      if (osrmRoutes.length > 0) {
+        return osrmRoutes[0];
+      }
+      throw new Error('No route found from OSRM');
+    }
+
     const locations: ValhallaLocation[] = [
       this.toValhallaLocation(origin, 'break'),
       ...waypoints.map((wp) => this.toValhallaLocation(wp, 'through')),
@@ -150,6 +176,7 @@ export class ValhallaService {
         units: 'kilometers',
         language: 'ru-RU',
       },
+      alternates: options?.alternates,
     };
 
     try {
@@ -163,8 +190,274 @@ export class ValhallaService {
       return response.data;
     } catch (error) {
       this.logger.error(`Valhalla route error: ${error.message}`, error.stack);
+      // Fallback to OSRM on error
+      this.logger.warn('Falling back to OSRM due to Valhalla error');
+      const osrmRoutes = await this.routeWithOSRM(origin, destination, mode, 0);
+      if (osrmRoutes.length > 0) {
+        return osrmRoutes[0];
+      }
       throw error;
     }
+  }
+
+  // Построение маршрута с альтернативами
+  async routeWithAlternatives(
+    origin: Coordinates,
+    destination: Coordinates,
+    mode: TransportMode = TransportMode.CAR,
+    numAlternatives: number = 2,
+    options?: {
+      avoidHighways?: boolean;
+      avoidTolls?: boolean;
+    },
+  ): Promise<ValhallaRouteResponse[]> {
+    // Check if Valhalla is available, fallback to OSRM if not
+    const valhallaReady = await this.isValhallaAvailable();
+    if (!valhallaReady) {
+      this.logger.warn('Valhalla not available, falling back to OSRM');
+      return this.routeWithOSRM(origin, destination, mode, numAlternatives);
+    }
+
+    const locations: ValhallaLocation[] = [
+      this.toValhallaLocation(origin, 'break'),
+      this.toValhallaLocation(destination, 'break'),
+    ];
+
+    const costing = this.getCostingProfile(mode);
+    const costingOptions: Record<string, any> = {};
+
+    if (options?.avoidHighways && costing === 'auto') {
+      costingOptions.auto = { use_highways: 0.0 };
+    }
+    if (options?.avoidTolls && costing === 'auto') {
+      costingOptions.auto = {
+        ...costingOptions.auto,
+        use_tolls: 0.0,
+      };
+    }
+
+    const request: ValhallaRouteRequest = {
+      locations,
+      costing,
+      costing_options: Object.keys(costingOptions).length > 0 ? costingOptions : undefined,
+      directions_options: {
+        units: 'kilometers',
+        language: 'ru-RU',
+      },
+      alternates: numAlternatives,
+    };
+
+    try {
+      const response = await firstValueFrom(
+        this.httpService.post<any>(
+          `${this.baseUrl}/route`,
+          request,
+          { timeout: this.timeout },
+        ),
+      );
+
+      // Valhalla returns alternates in the response as separate trips
+      const routes: ValhallaRouteResponse[] = [];
+
+      // Main route
+      if (response.data.trip) {
+        routes.push({ trip: response.data.trip });
+      }
+
+      // Alternative routes (if any)
+      if (response.data.alternates) {
+        for (const alt of response.data.alternates) {
+          if (alt.trip) {
+            routes.push({ trip: alt.trip });
+          }
+        }
+      }
+
+      return routes;
+    } catch (error) {
+      this.logger.error(`Valhalla route with alternatives error: ${error.message}`, error.stack);
+      // Fallback to OSRM on error
+      this.logger.warn('Falling back to OSRM due to Valhalla error');
+      return this.routeWithOSRM(origin, destination, mode, numAlternatives);
+    }
+  }
+
+  // OSRM fallback routing
+  private async routeWithOSRM(
+    origin: Coordinates,
+    destination: Coordinates,
+    mode: TransportMode,
+    numAlternatives: number,
+  ): Promise<ValhallaRouteResponse[]> {
+    const profile = mode === TransportMode.CAR ? 'driving' :
+                    mode === TransportMode.BICYCLE ? 'cycling' : 'foot';
+
+    // OSRM expects alternatives=true or a number (max alternatives to return)
+    const alternativesParam = numAlternatives > 0 ? 'true' : 'false';
+    const url = `${this.osrmBaseUrl}/route/v1/${profile}/${origin.longitude},${origin.latitude};${destination.longitude},${destination.latitude}?overview=full&geometries=polyline6&alternatives=${alternativesParam}&steps=true`;
+
+    try {
+      const response = await firstValueFrom(
+        this.httpService.get<any>(url, { timeout: this.timeout }),
+      );
+
+      if (response.data.code !== 'Ok' || !response.data.routes?.length) {
+        throw new Error('OSRM returned no routes');
+      }
+
+      // Convert OSRM response to Valhalla-like format
+      const routes = response.data.routes.map((osrmRoute: any) => this.convertOSRMToValhalla(osrmRoute));
+
+      // If we need more alternatives, generate "scenic" routes via detour points
+      if (numAlternatives >= 2 && routes.length < 3) {
+        // Generate first scenic route (offset to one side)
+        try {
+          const scenicRoute1 = await this.generateScenicRoute(origin, destination, profile, 1);
+          if (scenicRoute1) {
+            routes.push(scenicRoute1);
+          }
+        } catch (e) {
+          this.logger.warn(`Failed to generate scenic route 1: ${e.message}`);
+        }
+
+        // Generate second scenic route (offset to the other side) if still need more
+        if (routes.length < 3) {
+          try {
+            const scenicRoute2 = await this.generateScenicRoute(origin, destination, profile, -1);
+            if (scenicRoute2) {
+              routes.push(scenicRoute2);
+            }
+          } catch (e) {
+            this.logger.warn(`Failed to generate scenic route 2: ${e.message}`);
+          }
+        }
+      }
+
+      return routes;
+    } catch (error) {
+      this.logger.error(`OSRM route error: ${error.message}`);
+      throw error;
+    }
+  }
+
+  // Generate a scenic/alternative route by going through a detour point
+  // direction: 1 = offset to one side, -1 = offset to the other side
+  private async generateScenicRoute(
+    origin: Coordinates,
+    destination: Coordinates,
+    profile: string,
+    direction: number = 1,
+  ): Promise<ValhallaRouteResponse | null> {
+    // Calculate a detour point perpendicular to the direct route
+    const midLat = (origin.latitude + destination.latitude) / 2;
+    const midLng = (origin.longitude + destination.longitude) / 2;
+
+    // Calculate perpendicular offset (rotate 90 degrees)
+    const dLat = destination.latitude - origin.latitude;
+    const dLng = destination.longitude - origin.longitude;
+    const distance = Math.sqrt(dLat * dLat + dLng * dLng);
+
+    // Offset by ~30% of the direct distance, perpendicular to the route
+    // direction controls which side of the route to offset
+    const offsetFactor = 0.3 * direction;
+    const perpLat = -dLng / distance * offsetFactor * distance;
+    const perpLng = dLat / distance * offsetFactor * distance;
+
+    // Create detour point (offset to one side based on direction)
+    const detourPoint: Coordinates = {
+      latitude: midLat + perpLat,
+      longitude: midLng + perpLng,
+    };
+
+    const url = `${this.osrmBaseUrl}/route/v1/${profile}/${origin.longitude},${origin.latitude};${detourPoint.longitude},${detourPoint.latitude};${destination.longitude},${destination.latitude}?overview=full&geometries=polyline6&steps=true`;
+
+    try {
+      const response = await firstValueFrom(
+        this.httpService.get<any>(url, { timeout: this.timeout }),
+      );
+
+      if (response.data.code === 'Ok' && response.data.routes?.length > 0) {
+        const side = direction > 0 ? 'left' : 'right';
+        this.logger.log(`Generated scenic route via detour point (${side} side)`);
+        return this.convertOSRMToValhalla(response.data.routes[0]);
+      }
+    } catch (e) {
+      this.logger.warn(`Scenic route request failed: ${e.message}`);
+    }
+
+    return null;
+  }
+
+  // Convert OSRM response to Valhalla format
+  private convertOSRMToValhalla(osrmRoute: any): ValhallaRouteResponse {
+    // Collect all maneuvers from all legs
+    const allManeuvers: any[] = [];
+    let maneuverIndex = 0;
+    for (const leg of osrmRoute.legs) {
+      if (leg.steps) {
+        for (const step of leg.steps) {
+          allManeuvers.push({
+            type: this.mapOSRMManeuverType(step.maneuver?.type),
+            instruction: step.name || step.maneuver?.type || 'Continue',
+            begin_shape_index: maneuverIndex,
+            end_shape_index: maneuverIndex + 1,
+            length: (step.distance || 0) / 1000,
+            time: step.duration || 0,
+            travel_mode: 'drive',
+            travel_type: 'car',
+          });
+          maneuverIndex++;
+        }
+      }
+    }
+
+    // Create single leg with the full route geometry
+    // OSRM's osrmRoute.geometry is the complete polyline for the entire route
+    const singleLeg: ValhallaLeg = {
+      maneuvers: allManeuvers,
+      summary: {
+        length: (osrmRoute.distance || 0) / 1000,
+        time: osrmRoute.duration || 0,
+      },
+      shape: osrmRoute.geometry, // Full route polyline6 encoded
+    };
+
+    return {
+      trip: {
+        locations: [],
+        legs: [singleLeg],
+        summary: {
+          length: (osrmRoute.distance || 0) / 1000, // meters to km
+          time: osrmRoute.duration || 0,
+          min_lat: 0,
+          min_lon: 0,
+          max_lat: 0,
+          max_lon: 0,
+        },
+        status: 0,
+        status_message: 'Found route',
+        units: 'kilometers',
+        language: 'en-US',
+      },
+    };
+  }
+
+  private mapOSRMManeuverType(osrmType: string): number {
+    const mapping: Record<string, number> = {
+      'depart': 1,
+      'arrive': 4,
+      'turn': 9,
+      'continue': 7,
+      'new name': 7,
+      'slight right': 8,
+      'right': 9,
+      'sharp right': 10,
+      'slight left': 15,
+      'left': 14,
+      'sharp left': 13,
+      'uturn': 12,
+    };
+    return mapping[osrmType] || 7;
   }
 
   // Оптимизированный маршрут (TSP - порядок waypoints)
